@@ -5,3 +5,6 @@ Pillow==10.4.0
 streamlit
 pandas
 matplotlib
+ openai
+google-generativeai 
+e2b
