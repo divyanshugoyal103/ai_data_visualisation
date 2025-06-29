@@ -1,178 +1,89 @@
-import os
-import json
-import re
-import sys
-import io
-import contextlib
-import warnings
-from typing import Optional, List, Any, Tuple
-from PIL import Image
 import streamlit as st
 import pandas as pd
-import base64
-from io import BytesIO
-from together import Together
-from e2b_code_interpreter import Sandbox
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score
+import openai
 
-warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+# Load API key from secrets
+openai.api_key = st.secrets["api"]["openai_key"]
 
-pattern = re.compile(r"```python\n(.*?)\n```", re.DOTALL)
+# --- Load & preprocess data ---
+@st.cache_data
+def load_data():
+    df = pd.read_csv("your_salary_data.csv")
+    df.dropna(inplace=True)
+    cat_cols = ['experience_level', 'employment_type', 'job_title',
+                'employee_residence', 'company_location', 'company_size']
+    encoders = {col: LabelEncoder().fit(df[col]) for col in cat_cols}
+    for col, le in encoders.items():
+        df[col] = le.transform(df[col])
+    X = df.drop(['salary', 'salary_currency', 'salary_in_usd'], axis=1)
+    y = df['salary_in_usd']
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    return df, X_scaled, y, scaler, encoders
 
-def code_interpret(e2b_code_interpreter: Sandbox, code: str) -> Optional[List[Any]]:
-    with st.spinner('Executing code in E2B sandbox...'):
-        stdout_capture = io.StringIO()
-        stderr_capture = io.StringIO()
+df, X_scaled, y, scaler, encoders = load_data()
+X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
 
-        with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                exec = e2b_code_interpreter.run_code(code)
+# --- Train model ---
+model = RandomForestRegressor()
+model.fit(X_train, y_train)
 
-        if stderr_capture.getvalue():
-            print("[Code Interpreter Warnings/Errors]", file=sys.stderr)
-            print(stderr_capture.getvalue(), file=sys.stderr)
+# --- UI Inputs ---
+st.title("💼 Salary Predictor + OpenAI Assistant")
+st.markdown("Predict salaries based on job info and get insights from GPT-4!")
 
-        if stdout_capture.getvalue():
-            print("[Code Interpreter Output]", file=sys.stdout)
-            print(stdout_capture.getvalue(), file=sys.stdout)
+col1, col2 = st.columns(2)
 
-        if exec.error:
-            print(f"[Code Interpreter ERROR] {exec.error}", file=sys.stderr)
-            return None
-        return exec.results
+with col1:
+    work_year = st.slider("Work Year", 2020, 2025, 2025)
+    experience_level = st.selectbox("Experience Level", list(encoders['experience_level'].classes_))
+    employment_type = st.selectbox("Employment Type", list(encoders['employment_type'].classes_))
+    job_title = st.selectbox("Job Title", list(encoders['job_title'].classes_))
 
-def match_code_blocks(llm_response: str) -> str:
-    match = pattern.search(llm_response)
-    if match:
-        code = match.group(1)
-        return code
-    return ""
+with col2:
+    employee_residence = st.selectbox("Employee Residence", list(encoders['employee_residence'].classes_))
+    remote_ratio = st.slider("Remote Ratio (%)", 0, 100, 100)
+    company_location = st.selectbox("Company Location", list(encoders['company_location'].classes_))
+    company_size = st.selectbox("Company Size", list(encoders['company_size'].classes_))
 
-def chat_with_llm(e2b_code_interpreter: Sandbox, user_message: str, dataset_path: str) -> Tuple[Optional[List[Any]], str]:
-    # Update system prompt to include dataset path information
-    system_prompt = f"""You're a Python data scientist and data visualization expert. You are given a dataset at path '{dataset_path}' and also the user's query.
-You need to analyze the dataset and answer the user's query with a response and you run Python code to solve them.
-IMPORTANT: Always use the dataset path variable '{dataset_path}' in your code when reading the CSV file."""
+if st.button("Predict Salary"):
+    # Encode input
+    input_data = {
+        'work_year': work_year,
+        'experience_level': encoders['experience_level'].transform([experience_level])[0],
+        'employment_type': encoders['employment_type'].transform([employment_type])[0],
+        'job_title': encoders['job_title'].transform([job_title])[0],
+        'employee_residence': encoders['employee_residence'].transform([employee_residence])[0],
+        'remote_ratio': remote_ratio,
+        'company_location': encoders['company_location'].transform([company_location])[0],
+        'company_size': encoders['company_size'].transform([company_size])[0]
+    }
+    X_input = pd.DataFrame([input_data])
+    X_input_scaled = scaler.transform(X_input)
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
-    ]
+    # Predict
+    predicted_salary = model.predict(X_input_scaled)[0]
+    st.success(f"💰 Predicted Salary: **${predicted_salary:,.2f} USD**")
 
-    with st.spinner('Getting response from Together AI LLM model...'):
-        client = Together(api_key=st.session_state.together_api_key)
-        response = client.chat.completions.create(
-            model=st.session_state.model_name,
-            messages=messages,
-        )
-
-        response_message = response.choices[0].message
-        python_code = match_code_blocks(response_message.content)
-        
-        if python_code:
-            code_interpreter_results = code_interpret(e2b_code_interpreter, python_code)
-            return code_interpreter_results, response_message.content
-        else:
-            st.warning(f"Failed to match any Python code in model's response")
-            return None, response_message.content
-
-def upload_dataset(code_interpreter: Sandbox, uploaded_file) -> str:
-    dataset_path = f"./{uploaded_file.name}"
-    
-    try:
-        code_interpreter.files.write(dataset_path, uploaded_file)
-        return dataset_path
-    except Exception as error:
-        st.error(f"Error during file upload: {error}")
-        raise error
-
-
-def main():
-    """Main Streamlit application."""
-    st.title("📊 AI Data Visualization Agent")
-    st.write("Upload your dataset and ask questions about it!")
-
-    # Initialize session state variables
-    if 'together_api_key' not in st.session_state:
-        st.session_state.together_api_key = ''
-    if 'e2b_api_key' not in st.session_state:
-        st.session_state.e2b_api_key = ''
-    if 'model_name' not in st.session_state:
-        st.session_state.model_name = ''
-
-    with st.sidebar:
-        st.header("API Keys and Model Configuration")
-        st.session_state.together_api_key = st.sidebar.text_input("Together AI API Key", type="password")
-        st.sidebar.info("💡 Everyone gets a free $1 credit by Together AI - AI Acceleration Cloud platform")
-        st.sidebar.markdown("[Get Together AI API Key](https://api.together.ai/signin)")
-        
-        st.session_state.e2b_api_key = st.sidebar.text_input("Enter E2B API Key", type="password")
-        st.sidebar.markdown("[Get E2B API Key](https://e2b.dev/docs/legacy/getting-started/api-key)")
-        
-        # Add model selection dropdown
-        model_options = {
-            "Meta-Llama 3.1 405B": "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo",
-            "DeepSeek V3": "deepseek-ai/DeepSeek-V3",
-            "Qwen 2.5 7B": "Qwen/Qwen2.5-7B-Instruct-Turbo",
-            "Meta-Llama 3.3 70B": "meta-llama/Llama-3.3-70B-Instruct-Turbo"
-        }
-        st.session_state.model_name = st.selectbox(
-            "Select Model",
-            options=list(model_options.keys()),
-            index=0  # Default to first option
-        )
-        st.session_state.model_name = model_options[st.session_state.model_name]
-
-    uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
-    
-    if uploaded_file is not None:
-        # Display dataset with toggle
-        df = pd.read_csv(uploaded_file)
-        st.write("Dataset:")
-        show_full = st.checkbox("Show full dataset")
-        if show_full:
-            st.dataframe(df)
-        else:
-            st.write("Preview (first 5 rows):")
-            st.dataframe(df.head())
-        # Query input
-        query = st.text_area("What would you like to know about your data?",
-                            "Can you compare the average cost for two people between different categories?")
-        
-        if st.button("Analyze"):
-            if not st.session_state.together_api_key or not st.session_state.e2b_api_key:
-                st.error("Please enter both API keys in the sidebar.")
-            else:
-                with Sandbox(api_key=st.session_state.e2b_api_key) as code_interpreter:
-                    # Upload the dataset
-                    dataset_path = upload_dataset(code_interpreter, uploaded_file)
-                    
-                    # Pass dataset_path to chat_with_llm
-                    code_results, llm_response = chat_with_llm(code_interpreter, query, dataset_path)
-                    
-                    # Display LLM's text response
-                    st.write("AI Response:")
-                    st.write(llm_response)
-                    
-                    # Display results/visualizations
-                    if code_results:
-                        for result in code_results:
-                            if hasattr(result, 'png') and result.png:  # Check if PNG data is available
-                                # Decode the base64-encoded PNG data
-                                png_data = base64.b64decode(result.png)
-                                
-                                # Convert PNG data to an image and display it
-                                image = Image.open(BytesIO(png_data))
-                                st.image(image, caption="Generated Visualization", use_container_width=False)
-                            elif hasattr(result, 'figure'):  # For matplotlib figures
-                                fig = result.figure  # Extract the matplotlib figure
-                                st.pyplot(fig)  # Display using st.pyplot
-                            elif hasattr(result, 'show'):  # For plotly figures
-                                st.plotly_chart(result)
-                            elif isinstance(result, (pd.DataFrame, pd.Series)):
-                                st.dataframe(result)
-                            else:
-                                st.write(result)  
-
-if __name__ == "__main__":
-    main()
+    # --- OpenAI Explanation ---
+    with st.spinner("🔍 Asking GPT-4 for insights..."):
+        prompt = f"""
+        A {experience_level} {job_title} in {employee_residence} working {employment_type} with {remote_ratio}% remote work,
+        at a {company_size}-sized company in {company_location}, in {work_year}, is predicted to earn ${predicted_salary:,.0f} USD annually.
+        Explain why this salary might make sense and suggest ways to improve it.
+        """
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-4",
+                messages=[{"role": "user", "content": prompt}]
+            )
+            explanation = response['choices'][0]['message']['content']
+            st.markdown("### 🤖 GPT-4 Insight:")
+            st.write(explanation)
+        except Exception as e:
+            st.error(f"OpenAI Error: {e}")
